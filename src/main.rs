@@ -1,3 +1,4 @@
+mod audio;
 mod llm;
 mod stt;
 mod tts;

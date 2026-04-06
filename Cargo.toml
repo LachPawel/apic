@@ -10,6 +10,8 @@ anyhow = "1"
 whisper-rs = "0.16"
 voice-g2p = "0.2.2"
 voice-tts = "0.2.1"
+cpal = "0.15"
+rodio = "0.22"
 
 [dev-dependencies]
 wiremock = "0.6"
