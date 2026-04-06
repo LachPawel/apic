@@ -8,6 +8,8 @@ async-openai = { version = "0.34", features = ["chat-completion"] }
 tokio = { version = "1", features = ["full"] }
 anyhow = "1"
 whisper-rs = "0.16"
+voice-g2p = "0.2.2"
+voice-tts = "0.2.1"
 
 [dev-dependencies]
 wiremock = "0.6"
