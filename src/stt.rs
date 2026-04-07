@@ -12,7 +12,10 @@ pub fn init_whisper(model_path: &Path) -> Result<WhisperContext> {
     );
     WhisperContext::new_with_params(
         model_path.to_str().unwrap(),
-        WhisperContextParameters::default(),
+        WhisperContextParameters {
+            use_gpu: true,
+            ..WhisperContextParameters::default()
+        },
     )
     .map_err(|e| anyhow::anyhow!("Failed to load whisper model: {e}"))
 }

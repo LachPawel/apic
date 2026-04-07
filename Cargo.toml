@@ -12,6 +12,9 @@ voice-g2p = "0.2.2"
 voice-tts = "0.2.1"
 cpal = "0.15"
 rodio = "0.22"
+aic-sdk = { version = "0.15", features = ["download-lib"] }
+futures = "0.3"
+dotenvy = "0.15"
 
 [dev-dependencies]
 wiremock = "0.6"

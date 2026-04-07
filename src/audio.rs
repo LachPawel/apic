@@ -1,103 +1,206 @@
+use aic_sdk::{Model, Processor, ProcessorConfig, VadParameter};
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use rodio::buffer::SamplesBuffer;
 use rodio::{DeviceSinkBuilder, Player};
+use std::collections::VecDeque;
 use std::num::NonZero;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 const TARGET_HZ: u32 = 16_000;
 
-/// Capture mic audio for `duration_secs` seconds, returned as 16kHz mono f32.
+/// Number of 16kHz mono samples per Quail VF processing chunk (10ms).
+pub const FRAMES_PER_CHUNK: usize = 160;
+
+/// After this many consecutive silent chunks, the accumulated speech is
+/// committed as a complete utterance. 40 chunks × 10ms = 400ms hold.
+const SILENCE_CHUNKS_TO_COMMIT: usize = 40;
+
+/// Run the continuous capture + VAD loop. Intended to be called from a
+/// dedicated `std::thread::spawn` closure; it never returns.
 ///
-/// Records at the device's native rate/format, then converts to mono and
-/// resamples to 16kHz via linear interpolation. This avoids the
-/// "stream config not supported" error that comes from forcing 16kHz on
-/// devices whose native rate is 44100 or 48000 Hz.
-pub fn record(duration_secs: f32) -> Result<Vec<f32>> {
+/// Each time the VAD detects the end of an utterance, the voiced audio
+/// (16kHz mono f32) is sent via `utterance_tx`. If speech is detected
+/// while `is_speaking` is true, a `()` is sent via `barge_in_tx`.
+pub fn run_capture_loop(
+    vad_model_path: std::path::PathBuf,
+    license_key: String,
+    utterance_tx: tokio::sync::mpsc::Sender<Vec<f32>>,
+    is_speaking: Arc<AtomicBool>,
+    barge_in_tx: tokio::sync::mpsc::Sender<()>,
+) {
+    // ── Quail VF initialisation ───────────────────────────────────────────
+    let model =
+        Model::from_file(&vad_model_path).expect("Quail VF: model load failed. Download from \
+            https://artifacts.ai-coustics.io/models/quail-vf-2-0-l-16khz/v2/\
+            quail_vf_2_0_l_16khz_d42jls1e_v18.aicmodel");
+
+    let mut processor =
+        Processor::new(&model, &license_key).expect("Quail VF: processor creation failed \
+            (check AIC_SDK_LICENSE env var)");
+
+    let config = ProcessorConfig::optimal(&model);
+    processor
+        .initialize(&config)
+        .expect("Quail VF: processor initialization failed");
+
+    let vad = processor.vad_context();
+    // Hold for 400ms after last voiced frame before committing an utterance.
+    vad.set_parameter(VadParameter::SpeechHoldDuration, 0.4)
+        .expect("VAD: SpeechHoldDuration");
+    // Require 80ms of continuous speech before triggering — suppresses clicks.
+    vad.set_parameter(VadParameter::MinimumSpeechDuration, 0.08)
+        .expect("VAD: MinimumSpeechDuration");
+
+    // ── cpal mic setup ────────────────────────────────────────────────────
     let host = cpal::default_host();
     let device = host
         .default_input_device()
-        .ok_or_else(|| anyhow::anyhow!("No default input device found"))?;
-
+        .expect("cpal: no default input device");
     let supported = device
         .default_input_config()
-        .map_err(|e| anyhow::anyhow!("Cannot get default input config: {e}"))?;
+        .expect("cpal: cannot get default input config");
 
     let channels = supported.channels();
     let device_hz = supported.sample_rate().0;
 
-    let config = cpal::StreamConfig {
+    let stream_config = cpal::StreamConfig {
         channels,
         sample_rate: supported.sample_rate(),
         buffer_size: cpal::BufferSize::Default,
     };
 
-    let raw: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
-    let raw_cb = Arc::clone(&raw);
+    // Bounded channel from cpal callback → our processing loop.
+    // 256 × native-size callback ≈ several seconds of headroom.
+    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<Vec<f32>>(256);
+    let raw_tx_i16 = raw_tx.clone();
 
     let stream = match supported.sample_format() {
-        cpal::SampleFormat::F32 => device.build_input_stream(
-            &config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                raw_cb.lock().unwrap().extend_from_slice(data);
-            },
-            |e| eprintln!("cpal error: {e}"),
-            None,
-        )?,
-        cpal::SampleFormat::I16 => device.build_input_stream(
-            &config,
-            move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                raw_cb
-                    .lock()
-                    .unwrap()
-                    .extend(data.iter().map(|&s| s as f32 / 32_768.0));
-            },
-            |e| eprintln!("cpal error: {e}"),
-            None,
-        )?,
-        fmt => {
-            return Err(anyhow::anyhow!(
-                "Unsupported sample format {fmt:?}. Expected F32 or I16."
-            ))
+        cpal::SampleFormat::F32 => device
+            .build_input_stream(
+                &stream_config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let _ = raw_tx.try_send(data.to_vec());
+                },
+                |e| eprintln!("[audio] cpal error: {e}"),
+                None,
+            )
+            .expect("cpal: failed to build F32 input stream"),
+        cpal::SampleFormat::I16 => device
+            .build_input_stream(
+                &stream_config,
+                move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                    let converted: Vec<f32> =
+                        data.iter().map(|&s| s as f32 / 32_768.0).collect();
+                    let _ = raw_tx_i16.try_send(converted);
+                },
+                |e| eprintln!("[audio] cpal error: {e}"),
+                None,
+            )
+            .expect("cpal: failed to build I16 input stream"),
+        fmt => panic!("[audio] unsupported sample format: {fmt:?}"),
+    };
+
+    stream.play().expect("cpal: failed to start input stream");
+
+    eprintln!("[audio] capture started ({device_hz} Hz, {channels} ch)");
+
+    // How many raw interleaved samples correspond to one FRAMES_PER_CHUNK
+    // mono 16kHz chunk? We collect this many from the ring buffer before
+    // running one Quail VF + VAD pass.
+    let device_chunk_frames =
+        (FRAMES_PER_CHUNK as u64 * device_hz as u64 / TARGET_HZ as u64) as usize;
+    let raw_chunk_samples = device_chunk_frames * channels as usize;
+
+    // ── Processing state ─────────────────────────────────────────────────
+    let mut pending: VecDeque<f32> = VecDeque::new();
+    let mut voiced_buf: Vec<f32> = Vec::new();
+    let mut in_speech = false;
+    let mut silence_chunks: usize = 0;
+
+    // ── Main loop ─────────────────────────────────────────────────────────
+    for raw in &raw_rx {
+        pending.extend(raw.iter().copied());
+
+        while pending.len() >= raw_chunk_samples {
+            // Drain one device-rate chunk.
+            let chunk: Vec<f32> = pending.drain(..raw_chunk_samples).collect();
+
+            // Mix interleaved multi-channel audio down to mono.
+            let mono: Vec<f32> = if channels == 1 {
+                chunk
+            } else {
+                chunk
+                    .chunks_exact(channels as usize)
+                    .map(|frame| frame.iter().sum::<f32>() / channels as f32)
+                    .collect()
+            };
+
+            // Resample from device rate to 16kHz.
+            let mut chunk_16k: Vec<f32> = if device_hz == TARGET_HZ {
+                mono
+            } else {
+                resample_linear(&mono, device_hz, TARGET_HZ)
+            };
+
+            // Pad or trim to exactly FRAMES_PER_CHUNK so Quail VF is happy.
+            chunk_16k.resize(FRAMES_PER_CHUNK, 0.0);
+
+            // Quail VF: enhance in-place, then query VAD.
+            if let Err(e) = processor.process_sequential(&mut chunk_16k) {
+                eprintln!("[audio] Quail VF process error: {e}");
+                continue;
+            }
+            let speech = vad.is_speech_detected();
+
+            // Barge-in: if the main loop is playing TTS and we hear speech,
+            // signal it to stop.
+            if speech && is_speaking.load(Ordering::Relaxed) {
+                let _ = barge_in_tx.try_send(());
+            }
+
+            // VAD state machine.
+            if speech {
+                in_speech = true;
+                silence_chunks = 0;
+                voiced_buf.extend_from_slice(&chunk_16k);
+            } else if in_speech {
+                silence_chunks += 1;
+                voiced_buf.extend_from_slice(&chunk_16k);
+
+                if silence_chunks >= SILENCE_CHUNKS_TO_COMMIT {
+                    // Trim the trailing silence, then send the utterance.
+                    let trim = silence_chunks * FRAMES_PER_CHUNK;
+                    let end = voiced_buf.len().saturating_sub(trim);
+                    if end > 0 {
+                        let utterance = voiced_buf[..end].to_vec();
+                        // blocking_send: OK to park briefly while main loop
+                        // catches up; the capture loop just accumulates more.
+                        let _ = utterance_tx.blocking_send(utterance);
+                    }
+                    voiced_buf.clear();
+                    in_speech = false;
+                    silence_chunks = 0;
+                }
+            }
         }
-    };
-
-    stream
-        .play()
-        .map_err(|e| anyhow::anyhow!("Failed to start input stream: {e}"))?;
-
-    std::thread::sleep(Duration::from_secs_f32(duration_secs));
-    drop(stream); // stops callbacks before we read the buffer
-
-    let raw = raw.lock().unwrap().to_vec();
-
-    // Mix down to mono.
-    let mono: Vec<f32> = if channels == 1 {
-        raw
-    } else {
-        raw.chunks_exact(channels as usize)
-            .map(|frame| frame.iter().sum::<f32>() / channels as f32)
-            .collect()
-    };
-
-    // Resample to 16kHz if needed.
-    if device_hz == TARGET_HZ {
-        return Ok(mono);
     }
+}
 
-    let out_len = (mono.len() as f64 * TARGET_HZ as f64 / device_hz as f64) as usize;
-    let mut out = Vec::with_capacity(out_len);
-    for i in 0..out_len {
-        let src = i as f64 * device_hz as f64 / TARGET_HZ as f64;
-        let idx = src as usize;
-        let frac = (src - idx as f64) as f32;
-        let a = mono.get(idx).copied().unwrap_or(0.0);
-        let b = mono.get(idx + 1).copied().unwrap_or(a);
-        out.push(a + (b - a) * frac);
-    }
-
-    Ok(out)
+/// Linear-interpolation resample from `in_hz` to `out_hz` (mono f32).
+fn resample_linear(input: &[f32], in_hz: u32, out_hz: u32) -> Vec<f32> {
+    let out_len = (input.len() as f64 * out_hz as f64 / in_hz as f64) as usize;
+    (0..out_len)
+        .map(|i| {
+            let src = i as f64 * in_hz as f64 / out_hz as f64;
+            let idx = src as usize;
+            let frac = (src - idx as f64) as f32;
+            let a = input.get(idx).copied().unwrap_or(0.0);
+            let b = input.get(idx + 1).copied().unwrap_or(a);
+            a + (b - a) * frac
+        })
+        .collect()
 }
 
 /// Play `samples` through the default output device.
