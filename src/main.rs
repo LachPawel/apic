@@ -92,10 +92,20 @@ async fn main() -> Result<()> {
         eprintln!("You: {transcript}");
 
         // 3. Stream LLM response; TTS + play each sentence as it arrives.
-        let (sentence_tx, mut sentence_rx) =
-            tokio::sync::mpsc::unbounded_channel::<String>();
+        //
+        // Pipeline: three concurrent stages so each one runs while the next waits.
+        //
+        //   LLM stream  →  sentence_tx  →  TTS task  →  audio_tx  →  play loop
+        //
+        // The TTS task synthesizes sentence N+1 while the play loop is still
+        // playing sentence N, hiding ~146ms of TTS latency per turn.
 
-        // Spawn the streaming task so it runs concurrently with our TTS loop.
+        let (sentence_tx, mut sentence_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        // Buffer up to 2 synthesized sentences ahead so TTS is never idle.
+        let (audio_tx, mut audio_rx) =
+            tokio::sync::mpsc::channel::<(String, Vec<f32>)>(2);
+
+        // Stage 1: LLM stream → sentences.
         let client_clone = Arc::clone(&client);
         let transcript_clone = transcript.clone();
         tokio::spawn(async move {
@@ -107,29 +117,38 @@ async fn main() -> Result<()> {
             }
         });
 
+        // Stage 2: sentences → TTS audio (runs while stage 3 plays).
+        let tts_tx_clone = tts_tx.clone();
+        tokio::spawn(async move {
+            while let Some(sentence) = sentence_rx.recv().await {
+                if sentence.trim().is_empty() {
+                    continue;
+                }
+                let (tts_reply_tx, tts_reply_rx) = oneshot::channel();
+                if tts_tx_clone.send((sentence.clone(), tts_reply_tx)).is_err() {
+                    break;
+                }
+                match tts_reply_rx.await {
+                    Ok(audio) => {
+                        if audio_tx.send((sentence, audio)).await.is_err() {
+                            break; // play loop dropped — turn cancelled
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
         // Drain stale barge-in signals from the previous turn.
         while barge_in_rx.try_recv().is_ok() {}
         is_speaking.store(false, Ordering::Relaxed);
 
         let mut interrupted = false;
 
-        while let Some(sentence) = sentence_rx.recv().await {
-            if sentence.trim().is_empty() {
-                continue;
-            }
+        // Stage 3: play synthesized sentences in order.
+        while let Some((sentence, audio_samples)) = audio_rx.recv().await {
             eprintln!("apic: {sentence}");
 
-            // TTS on the Kokoro thread.
-            let (tts_reply_tx, tts_reply_rx) = oneshot::channel();
-            tts_tx
-                .send((sentence, tts_reply_tx))
-                .map_err(|_| anyhow::anyhow!("TTS thread died"))?;
-
-            let audio_samples = tts_reply_rx
-                .await
-                .map_err(|_| anyhow::anyhow!("TTS reply channel closed"))?;
-
-            // Play, flagging is_speaking so the capture loop can detect barge-in.
             is_speaking.store(true, Ordering::Relaxed);
             if let Err(e) =
                 tokio::task::spawn_blocking(move || audio::play(&audio_samples, 24_000)).await?
@@ -138,7 +157,6 @@ async fn main() -> Result<()> {
             }
             is_speaking.store(false, Ordering::Relaxed);
 
-            // Check barge-in between sentences.
             if barge_in_rx.try_recv().is_ok() {
                 eprintln!("[barge-in] interrupting\n");
                 interrupted = true;
@@ -147,12 +165,7 @@ async fn main() -> Result<()> {
         }
 
         is_speaking.store(false, Ordering::Relaxed);
-
-        if interrupted {
-            // Dropping sentence_rx causes the LLM stream task to see a closed
-            // channel on its next send() and stop naturally.
-            drop(sentence_rx);
-        }
+        let _ = interrupted; // audio_rx drop cancels the TTS task naturally
 
         eprintln!();
     }

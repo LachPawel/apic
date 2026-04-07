@@ -14,8 +14,8 @@ const TARGET_HZ: u32 = 16_000;
 pub const FRAMES_PER_CHUNK: usize = 160;
 
 /// After this many consecutive silent chunks, the accumulated speech is
-/// committed as a complete utterance. 40 chunks × 10ms = 400ms hold.
-const SILENCE_CHUNKS_TO_COMMIT: usize = 40;
+/// committed as a complete utterance. 20 chunks × 10ms = 200ms hold.
+const SILENCE_CHUNKS_TO_COMMIT: usize = 20;
 
 /// Run the continuous capture + VAD loop. Intended to be called from a
 /// dedicated `std::thread::spawn` closure; it never returns.
@@ -28,7 +28,7 @@ pub fn run_capture_loop(
     license_key: String,
     utterance_tx: tokio::sync::mpsc::Sender<Vec<f32>>,
     is_speaking: Arc<AtomicBool>,
-    barge_in_tx: tokio::sync::mpsc::Sender<()>,
+    _barge_in_tx: tokio::sync::mpsc::Sender<()>,
 ) {
     // ── Quail VF initialisation ───────────────────────────────────────────
     let model =
@@ -118,6 +118,11 @@ pub fn run_capture_loop(
     let mut voiced_buf: Vec<f32> = Vec::new();
     let mut in_speech = false;
     let mut silence_chunks: usize = 0;
+    // After playback stops, ignore mic for this many chunks (~250ms) so room
+    // echo doesn't trigger a false utterance.
+    const ECHO_COOLDOWN_CHUNKS: usize = 25;
+    let mut echo_cooldown: usize = 0;
+    let mut was_speaking = false;
 
     // ── Main loop ─────────────────────────────────────────────────────────
     for raw in &raw_rx {
@@ -154,10 +159,27 @@ pub fn run_capture_loop(
             }
             let speech = vad.is_speech_detected();
 
-            // Barge-in: if the main loop is playing TTS and we hear speech,
-            // signal it to stop.
-            if speech && is_speaking.load(Ordering::Relaxed) {
-                let _ = barge_in_tx.try_send(());
+            let speaking_now = is_speaking.load(Ordering::Relaxed);
+
+            // Detect the falling edge of is_speaking to start the cooldown.
+            if was_speaking && !speaking_now {
+                echo_cooldown = ECHO_COOLDOWN_CHUNKS;
+                // Discard anything accumulated while the speaker was active.
+                voiced_buf.clear();
+                in_speech = false;
+                silence_chunks = 0;
+            }
+            was_speaking = speaking_now;
+
+            // While the assistant is speaking or the echo cooldown is active,
+            // keep running Quail VF (it needs continuous audio to stay warm)
+            // but don't feed anything into the VAD state machine.
+            if speaking_now {
+                continue;
+            }
+            if echo_cooldown > 0 {
+                echo_cooldown -= 1;
+                continue;
             }
 
             // VAD state machine.
