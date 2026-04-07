@@ -1,6 +1,6 @@
 # TODOS
 
-## bench fixture (captured 2026-04-06)
+## bench fixture (captured 2026-04-06) — **Completed: 2026-04-07**
 
 Create `benches/fixtures/utterance.f32` — a 2-second pre-recorded utterance as raw
 f32 little-endian samples at 16kHz mono (32000 f32 values, ~128KB).

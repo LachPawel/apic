@@ -52,6 +52,7 @@ the results as a devrel artifact.
 ## Module structure
 
 src/
+  lib.rs      — public module exports (audio, llm, stt, tts) used by benchmarks
   main.rs     — pipeline orchestration, ties all modules together
   audio.rs    — mic capture via cpal, speaker playback via rodio
   stt.rs      — whisper-rs STT, takes f32 audio buffer, returns String
