@@ -1,8 +1,4 @@
-mod audio;
-mod llm;
-mod stt;
-mod tts;
-
+use apic::{audio, llm, stt, tts};
 use anyhow::Result;
 use std::path::PathBuf;
 use tokio::sync::oneshot;
